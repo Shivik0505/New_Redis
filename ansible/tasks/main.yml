@@ -1,0 +1,44 @@
+---
+# tasks file for redis
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install Redis
+  apt:
+    name: redis-server
+    state: present
+
+- name: Create Redis log directory
+  file:
+    path: /var/log/redis
+    state: directory
+    owner: redis
+    group: redis
+    mode: '0755'
+
+- name: Configure Redis from template
+  template:
+    src: redis.conf.j2
+    dest: /etc/redis/redis.conf
+    owner: redis
+    group: redis
+    mode: '0644'
+    backup: yes
+  notify:
+    - Restart Redis
+
+- name: Ensure Redis is running and enabled
+  service:
+    name: redis-server
+    state: started
+    enabled: yes
+
+- name: Wait for Redis to be ready
+  wait_for:
+    port: 6379
+    host: "{{ ansible_default_ipv4.address }}"
+    delay: 5
+    timeout: 30

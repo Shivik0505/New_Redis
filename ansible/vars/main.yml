@@ -1,0 +1,7 @@
+---
+# vars file for redis
+redis_bind_address: 0.0.0.0  # Changed from 127.0.0.1 to allow external connections
+redis_port: 6379
+redis_cluster_enabled: yes
+redis_cluster_config_file: nodes.conf
+redis_cluster_node_timeout: 5000

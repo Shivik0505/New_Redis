@@ -1,0 +1,8 @@
+---
+- hosts: aws_ec2
+  become: yes
+  roles:
+    - role: ansible
+      vars:
+        ansible_ssh_private_key_file: "./redis-demo-key.pem"
+        ansible_ssh_user: ubuntu

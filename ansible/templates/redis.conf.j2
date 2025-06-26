@@ -1,0 +1,21 @@
+# Redis configuration for clustering
+bind {{ redis_bind_address }}
+port {{ redis_port }}
+protected-mode no
+
+# Cluster configuration
+cluster-enabled {{ redis_cluster_enabled }}
+cluster-config-file {{ redis_cluster_config_file }}
+cluster-node-timeout {{ redis_cluster_node_timeout }}
+
+# Persistence
+save 900 1
+save 300 10
+save 60 10000
+
+# Logging
+loglevel notice
+logfile /var/log/redis/redis-server.log
+
+# Memory management
+maxmemory-policy allkeys-lru
