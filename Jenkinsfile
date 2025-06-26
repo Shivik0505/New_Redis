@@ -19,6 +19,7 @@ pipeline {
         KEY_PAIR_NAME = "${params.keyPairName}"
         TF_IN_AUTOMATION = 'true'
         TF_INPUT = 'false'
+        PATH = "/opt/homebrew/bin:/usr/local/bin:${env.PATH}"
     }
 
     stages {
