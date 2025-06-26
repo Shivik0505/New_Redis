@@ -24,15 +24,15 @@ variable "pri-sub-3-id" {
 
 variable "ami-id" {
   type = string
-  default = "redis-demo-key"
+  default = "ami-09b0a86a2c84101e1"  # Ubuntu 22.04 LTS (ap-south-1)
 }
 
 variable "instance-type" {
   type = string
-  default = "redis-demo-key"
+  default = "t3.micro"
 }
 
 variable "key-name" {
   type = string
-  default = "redis-demo-key"
+  default = "redis-infra-key"
 }

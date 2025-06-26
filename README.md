@@ -110,7 +110,7 @@ This project deploys a complete Redis infrastructure on AWS using Infrastructure
 ```hcl
 variable "key-name" {
   type = string
-  default = "my-key-aws"  # ← Change this to your preferred key name
+  default = "redis-infra-key"  # ← Change this to your preferred key name
 }
 
 variable "instance-type" {
@@ -210,8 +210,8 @@ ansible-playbook -i aws_ec2.yaml playbook.yml --private-key=my-key-aws.pem
 
 **Solution:** The deployment automatically creates the key pair. If manual creation is needed:
 ```bash
-aws ec2 create-key-pair --key-name my-key-aws --region ap-south-1 --query 'KeyMaterial' --output text > my-key-aws.pem
-chmod 400 my-key-aws.pem
+aws ec2 create-key-pair --key-name redis-infra-key --region ap-south-1 --query 'KeyMaterial' --output text > redis-infra-key.pem
+chmod 400 redis-infra-key.pem
 ```
 
 #### 3. Security Group Conflicts
@@ -279,16 +279,16 @@ ansible-inventory -i aws_ec2.yaml --list
 
 #### 1. Connect to Bastion Host
 ```bash
-ssh -i my-key-aws.pem ubuntu@<PUBLIC_IP>
+ssh -i redis-infra-key.pem ubuntu@<PUBLIC_IP>
 ```
 
 #### 2. Connect to Redis Nodes (via Bastion)
 ```bash
 # Direct jump connection
-ssh -i my-key-aws.pem -J ubuntu@<BASTION_IP> ubuntu@<REDIS_NODE_IP>
+ssh -i redis-infra-key.pem -J ubuntu@<BASTION_IP> ubuntu@<REDIS_NODE_IP>
 
 # Or through bastion
-ssh -i my-key-aws.pem ubuntu@<BASTION_IP>
+ssh -i redis-infra-key.pem ubuntu@<BASTION_IP>
 # Then from bastion:
 ssh ubuntu@<REDIS_NODE_PRIVATE_IP>
 ```

@@ -12,15 +12,15 @@ fi
 
 # Step 1: Create key pair if it doesn't exist
 echo "Step 1: Checking/Creating key pair..."
-if ! aws ec2 describe-key-pairs --key-names redis-demo-key --region ap-south-1 >/dev/null 2>&1; then
-    echo "Creating key pair 'redis-demo-key'..."
-    aws ec2 create-key-pair --key-name redis-demo-key --region ap-south-1 --query 'KeyMaterial' --output text > redis-demo-key.pem
-    chmod 400 redis-demo-key.pem
+if ! aws ec2 describe-key-pairs --key-names redis-infra-key --region ap-south-1 >/dev/null 2>&1; then
+    echo "Creating key pair 'redis-infra-key'..."
+    aws ec2 create-key-pair --key-name redis-infra-key --region ap-south-1 --query 'KeyMaterial' --output text > redis-infra-key.pem
+    chmod 400 redis-infra-key.pem
     echo "Key pair created successfully!"
 else
-    echo "Key pair 'redis-demo-key' already exists."
+    echo "Key pair 'redis-infra-key' already exists."
     # Check if pem file exists locally
-    if [ ! -f "redis-demo-key.pem" ]; then
+    if [ ! -f "redis-infra-key.pem" ]; then
         echo "Warning: Key pair exists in AWS but .pem file not found locally."
         echo "You may need to download or recreate the key pair."
     fi
@@ -59,7 +59,7 @@ echo "=== Deployment completed successfully! ==="
 echo "Your Redis infrastructure is now ready."
 echo ""
 echo "To connect to your instances:"
-echo "1. Public instance: ssh -i ../redis-demo-key.pem ubuntu@\$(terraform output -raw public-instance-ip)"
+echo "1. Public instance: ssh -i ../redis-infra-key.pem ubuntu@\$(terraform output -raw public-instance-ip)"
 echo "2. Private instances: Connect via bastion host"
 echo ""
 echo "To configure Redis cluster, run Ansible playbook:"
