@@ -1,0 +1,1 @@
+{"Modules":[{"Key":"","Source":"","Dir":"."},{"Key":"instance","Source":"./instances","Dir":"instances"},{"Key":"peering","Source":"./vpc_peering","Dir":"vpc_peering"},{"Key":"security_groups","Source":"./security_group","Dir":"security_group"},{"Key":"subnet","Source":"./subnets","Dir":"subnets"},{"Key":"vpc","Source":"./vpc","Dir":"vpc"}]}
