@@ -248,20 +248,41 @@ pipeline {
                             
                             echo "Running Ansible with ${KEY_PAIR_NAME}.pem"
                             
+                            # Create dynamic inventory with bastion host configuration
+                            echo "Creating dynamic inventory with bastion host..."
+                            ./create-inventory.sh
+                            
                             # Update Ansible configuration to use the correct key
-                            sed -i "s/redis-demo-key/${KEY_PAIR_NAME}/g" aws_ec2.yaml || true
+                            sed -i "s/redis-demo-key/${KEY_PAIR_NAME}/g" inventory.ini || true
                             sed -i "s/redis-infra-key/${KEY_PAIR_NAME}/g" playbook.yml || true
                             
-                            # Test Ansible inventory
-                            echo "Testing Ansible inventory..."
-                            ansible-inventory -i aws_ec2.yaml --list
+                            # Test connectivity to bastion host first
+                            echo "Testing connectivity to bastion host..."
+                            BASTION_IP=$(aws ec2 describe-instances --region $AWS_DEFAULT_REGION --filters "Name=tag:Name,Values=redis-public" "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+                            echo "Bastion IP: $BASTION_IP"
+                            
+                            # Wait for SSH to be ready on bastion
+                            echo "Waiting for SSH to be ready on bastion host..."
+                            for i in {1..10}; do
+                                if ssh -i ${KEY_PAIR_NAME}.pem -o ConnectTimeout=10 -o StrictHostKeyChecking=no ubuntu@$BASTION_IP "echo 'Bastion SSH ready'" 2>/dev/null; then
+                                    echo "✅ Bastion host SSH is ready"
+                                    break
+                                else
+                                    echo "⏳ Waiting for bastion SSH... attempt $i/10"
+                                    sleep 15
+                                fi
+                            done
+                            
+                            # Test connectivity to all hosts
+                            echo "Testing connectivity to all hosts..."
+                            ansible all -i inventory.ini -m ping
                             
                             # Run Ansible playbook with retries
                             echo "Running Ansible playbook..."
-                            ansible-playbook -i aws_ec2.yaml playbook.yml --private-key="${KEY_PAIR_NAME}.pem" -v || {
+                            ansible-playbook -i inventory.ini playbook.yml --private-key="${KEY_PAIR_NAME}.pem" -v || {
                                 echo "First attempt failed, retrying in 30 seconds..."
                                 sleep 30
-                                ansible-playbook -i aws_ec2.yaml playbook.yml --private-key="${KEY_PAIR_NAME}.pem" -v
+                                ansible-playbook -i inventory.ini playbook.yml --private-key="${KEY_PAIR_NAME}.pem" -v
                             }
                         else
                             echo "⚠️  Key file ${KEY_PAIR_NAME}.pem not found."

@@ -11,7 +11,8 @@ compose:
    ansible_host: private_ip_address
    ansible_ssh_private_key_file: "./redis-infra-key.pem"
    ansible_ssh_user: ubuntu
-   ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=60'
+   # Use bastion host as jump server
+   ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=60 -o ProxyCommand="ssh -W %h:%p -i ./redis-infra-key.pem -o StrictHostKeyChecking=no ubuntu@13.203.223.190"'
 strict: False
 cache: True
 cache_timeout: 600

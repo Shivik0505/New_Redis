@@ -37,8 +37,8 @@
     enabled: yes
 
 - name: Wait for Redis to be ready
-  wait_for:
-    port: 6379
-    host: "{{ ansible_default_ipv4.address }}"
-    delay: 5
-    timeout: 30
+  command: redis-cli ping
+  register: redis_ping
+  until: redis_ping.stdout == "PONG"
+  retries: 10
+  delay: 3

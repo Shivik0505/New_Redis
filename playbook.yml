@@ -1,5 +1,5 @@
 ---
-- hosts: aws_ec2
+- hosts: redis_nodes
   become: yes
   roles:
     - role: ansible
