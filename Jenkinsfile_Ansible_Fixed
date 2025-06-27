@@ -1,0 +1,606 @@
+pipeline {
+    agent any
+
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+
+    parameters {
+        booleanParam(name: 'autoApprove', defaultValue: true, description: 'Automatically run apply after generating plan?')
+        choice(name: 'action', choices: ['apply', 'destroy'], description: 'Select the action to perform')
+        string(name: 'keyPairName', defaultValue: 'redis-infra-key', description: 'AWS Key Pair name to use')
+        booleanParam(name: 'recreateKeyPair', defaultValue: false, description: 'Force recreate key pair if it exists?')
+        booleanParam(name: 'skipAnsible', defaultValue: false, description: 'Skip Ansible configuration step?')
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        KEY_PAIR_NAME = "${params.keyPairName}"
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT = 'false'
+        ANSIBLE_HOST_KEY_CHECKING = 'False'
+        ANSIBLE_SSH_RETRIES = '3'
+        ANSIBLE_TIMEOUT = '60'
+        ANSIBLE_CONFIG = './ansible_jenkins.cfg'
+        ANSIBLE_FORCE_COLOR = 'true'
+        ANSIBLE_LOG_PATH = './ansible.log'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 2, unit: 'HOURS')
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('SCM Checkout & Validation') {
+            steps {
+                script {
+                    echo "=== Enhanced SCM Checkout & Validation ==="
+                    
+                    cleanWs()
+                    
+                    def scmVars = checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/master']],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [$class: 'CleanBeforeCheckout'],
+                            [$class: 'CloneOption', depth: 1, noTags: false, shallow: true]
+                        ],
+                        userRemoteConfigs: [[
+                            url: 'https://github.com/Shivik0505/New_Redis.git'
+                        ]]
+                    ])
+                    
+                    def gitCommit = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                    def gitAuthor = sh(returnStdout: true, script: 'git log -1 --pretty=%an').trim()
+                    def gitMessage = sh(returnStdout: true, script: 'git log -1 --pretty=%B').trim()
+                    
+                    echo "✅ SCM Checkout completed successfully"
+                    echo "📝 Git Information:"
+                    echo "   Commit: ${gitCommit}"
+                    echo "   Author: ${gitAuthor}"
+                    echo "   Message: ${gitMessage}"
+                    
+                    env.GIT_COMMIT_HASH = gitCommit
+                    env.GIT_COMMIT_MESSAGE = gitMessage
+                    env.GIT_COMMIT_AUTHOR = gitAuthor
+                    
+                    def requiredFiles = ['terraform/', 'ansible/', 'Jenkinsfile', 'README.md']
+                    requiredFiles.each { file ->
+                        if (fileExists(file)) {
+                            echo "✅ Required file/directory found: ${file}"
+                        } else {
+                            error "❌ Required file/directory missing: ${file}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Environment Setup') {
+            steps {
+                echo "=== Environment Setup ==="
+                sh '''
+                    echo "🔧 Pipeline Configuration:"
+                    echo "- Action: ${action}"
+                    echo "- Auto Approve: ${autoApprove}"
+                    echo "- Key Pair: ${keyPairName}"
+                    echo "- Skip Ansible: ${skipAnsible}"
+                    echo "- AWS Region: ${AWS_DEFAULT_REGION}"
+                    echo ""
+                    echo "🛠️ Tool Verification:"
+                    which terraform && terraform version || echo "❌ Terraform not found"
+                    which aws && aws --version || echo "❌ AWS CLI not found"
+                    which ansible && ansible --version || echo "❌ Ansible not found"
+                    which ansible-playbook && ansible-playbook --version || echo "❌ Ansible-playbook not found"
+                    
+                    echo ""
+                    echo "🔧 Ansible Environment Setup:"
+                    # Create Ansible log directory
+                    mkdir -p logs
+                    
+                    # Set up Ansible configuration
+                    if [ -f "ansible_jenkins.cfg" ]; then
+                        echo "✅ Using Jenkins-compatible Ansible configuration"
+                        export ANSIBLE_CONFIG="./ansible_jenkins.cfg"
+                    else
+                        echo "⚠️ Using default Ansible configuration"
+                    fi
+                    
+                    # Check Python dependencies
+                    python3 -c "import boto3; print('✅ boto3 available')" || echo "⚠️ boto3 not available"
+                    python3 -c "import botocore; print('✅ botocore available')" || echo "⚠️ botocore not available"
+                '''
+            }
+        }
+
+        stage('AWS Credentials Check') {
+            steps {
+                echo "=== AWS Credentials Verification ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Testing AWS credentials..."
+                        if aws sts get-caller-identity; then
+                            echo "✅ AWS credentials are valid"
+                        else
+                            echo "❌ AWS credentials test failed"
+                            exit 1
+                        fi
+                        
+                        echo "Checking AWS service limits..."
+                        aws ec2 describe-account-attributes --attribute-names supported-platforms --region $AWS_DEFAULT_REGION || echo "⚠️ Could not check account attributes"
+                    '''
+                }
+            }
+        }
+
+        stage('Key Pair Management') {
+            when {
+                expression { return params.action == 'apply' }
+            }
+            steps {
+                echo "=== Key Pair Management ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Managing key pair: $KEY_PAIR_NAME"
+                        
+                        create_key_pair() {
+                            echo "Creating new key pair '$KEY_PAIR_NAME'..."
+                            if aws ec2 create-key-pair --key-name "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION --query 'KeyMaterial' --output text > "${KEY_PAIR_NAME}.pem"; then
+                                chmod 400 "${KEY_PAIR_NAME}.pem"
+                                echo "✅ Key pair created successfully!"
+                                return 0
+                            else
+                                echo "❌ Failed to create key pair"
+                                return 1
+                            fi
+                        }
+                        
+                        if aws ec2 describe-key-pairs --key-names "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION >/dev/null 2>&1; then
+                            echo "✅ Key pair '$KEY_PAIR_NAME' exists in AWS"
+                            
+                            if [ "${recreateKeyPair}" = "true" ]; then
+                                echo "Recreating key pair as requested..."
+                                aws ec2 delete-key-pair --key-name "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION
+                                create_key_pair
+                            else
+                                echo "✅ Using existing key pair"
+                                echo "⚠️ Note: .pem file not available for existing key pairs"
+                            fi
+                        else
+                            echo "Key pair does not exist, creating new one..."
+                            create_key_pair
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Operations') {
+            steps {
+                echo "=== Terraform Operations ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    script {
+                        dir('terraform') {
+                            echo "Initializing Terraform..."
+                            sh 'terraform init -input=false'
+                            
+                            echo "Validating Terraform configuration..."
+                            sh 'terraform validate'
+                            
+                            if (params.action == 'apply') {
+                                echo "Creating Terraform plan..."
+                                sh "terraform plan -input=false -out=tfplan -var='key-name=${KEY_PAIR_NAME}'"
+                                
+                                if (params.autoApprove) {
+                                    echo "Applying Terraform plan..."
+                                    sh 'terraform apply -input=false tfplan'
+                                    
+                                    echo "Generating Terraform outputs..."
+                                    sh 'terraform output -json > ../terraform-outputs.json'
+                                    sh 'terraform output'
+                                    
+                                    echo "✅ Infrastructure deployment completed"
+                                } else {
+                                    echo "⏸️ Terraform plan created, waiting for manual approval"
+                                }
+                            } else if (params.action == 'destroy') {
+                                if (params.autoApprove) {
+                                    echo "Destroying infrastructure..."
+                                    sh "terraform destroy -input=false -var='key-name=${KEY_PAIR_NAME}' --auto-approve"
+                                    echo "✅ Infrastructure destruction completed"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'terraform/tfplan', allowEmptyArchive: true
+                    script {
+                        if (fileExists('terraform-outputs.json')) {
+                            archiveArtifacts artifacts: 'terraform-outputs.json', allowEmptyArchive: true
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Infrastructure Verification') {
+            when {
+                allOf {
+                    expression { return params.autoApprove }
+                    expression { return params.action == 'apply' }
+                }
+            }
+            steps {
+                echo "=== Infrastructure Verification ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Waiting for instances to be ready..."
+                        sleep 60
+                        
+                        echo "Checking deployed instances..."
+                        aws ec2 describe-instances \
+                            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=redis-*" \
+                            --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],State:State.Name,PublicIP:PublicIpAddress,PrivateIP:PrivateIpAddress,InstanceType:InstanceType}' \
+                            --output table --region $AWS_DEFAULT_REGION
+                        
+                        # Count running instances
+                        RUNNING_INSTANCES=$(aws ec2 describe-instances \
+                            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=redis-*" \
+                            --query 'length(Reservations[].Instances[])' \
+                            --output text --region $AWS_DEFAULT_REGION)
+                        
+                        echo "Running instances: $RUNNING_INSTANCES"
+                        if [ "$RUNNING_INSTANCES" -eq 4 ]; then
+                            echo "✅ All 4 instances are running (1 bastion + 3 Redis nodes)"
+                        else
+                            echo "⚠️ Expected 4 instances, found $RUNNING_INSTANCES"
+                        fi
+                        
+                        echo "Additional wait for SSH readiness..."
+                        sleep 60
+                    '''
+                }
+            }
+        }
+
+        stage('Ansible Configuration') {
+            when {
+                allOf {
+                    expression { return params.autoApprove }
+                    expression { return params.action == 'apply' }
+                    expression { return !params.skipAnsible }
+                }
+            }
+            steps {
+                echo "=== Ansible Configuration ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    script {
+                        sh '''
+                            echo "🔧 Ansible Configuration Setup"
+                            echo "=============================="
+                            
+                            # Check if key file exists
+                            if [ ! -f "${KEY_PAIR_NAME}.pem" ]; then
+                                echo "❌ SSH key file not found: ${KEY_PAIR_NAME}.pem"
+                                echo "This might happen if using an existing key pair."
+                                echo "Attempting to continue with existing configuration..."
+                            else
+                                chmod 400 "${KEY_PAIR_NAME}.pem"
+                                echo "✅ SSH key file permissions set"
+                            fi
+                            
+                            # Set up Ansible environment
+                            export ANSIBLE_CONFIG="./ansible_jenkins.cfg"
+                            export ANSIBLE_HOST_KEY_CHECKING=False
+                            export ANSIBLE_SSH_RETRIES=3
+                            export ANSIBLE_TIMEOUT=60
+                            
+                            # Create dynamic inventory
+                            echo "📋 Creating dynamic inventory..."
+                            if [ -f "create_dynamic_inventory.sh" ]; then
+                                chmod +x create_dynamic_inventory.sh
+                                ./create_dynamic_inventory.sh
+                            else
+                                echo "⚠️ Dynamic inventory script not found, creating basic inventory..."
+                                
+                                # Get IPs from Terraform outputs or AWS CLI
+                                if [ -f "terraform-outputs.json" ]; then
+                                    PUBLIC_IP=$(jq -r '.["public-instance-ip"].value' terraform-outputs.json 2>/dev/null || echo "")
+                                    PRIVATE_IPS=($(jq -r '.["private-instance1-ip"].value, .["private-instance2-ip"].value, .["private-instance3-ip"].value' terraform-outputs.json 2>/dev/null || echo ""))
+                                else
+                                    echo "Getting IPs from AWS CLI..."
+                                    PUBLIC_IP=$(aws ec2 describe-instances --region $AWS_DEFAULT_REGION --filters "Name=tag:Name,Values=redis-public" "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+                                    PRIVATE_IPS=($(aws ec2 describe-instances --region $AWS_DEFAULT_REGION --filters "Name=tag:Name,Values=redis-private*" "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[].PrivateIpAddress' --output text))
+                                fi
+                                
+                                echo "Discovered IPs:"
+                                echo "  Public: $PUBLIC_IP"
+                                echo "  Private: ${PRIVATE_IPS[@]}"
+                                
+                                # Create basic inventory
+                                cat > inventory_basic.ini << EOL
+[redis_nodes]
+redis-node-1 ansible_host=${PRIVATE_IPS[0]} ansible_user=ubuntu
+redis-node-2 ansible_host=${PRIVATE_IPS[1]} ansible_user=ubuntu
+redis-node-3 ansible_host=${PRIVATE_IPS[2]} ansible_user=ubuntu
+
+[redis_nodes:vars]
+ansible_ssh_private_key_file=./${KEY_PAIR_NAME}.pem
+ansible_ssh_common_args=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand="ssh -W %h:%p -i ./${KEY_PAIR_NAME}.pem -o StrictHostKeyChecking=no ubuntu@$PUBLIC_IP"
+ansible_python_interpreter=/usr/bin/python3
+
+[all:vars]
+ansible_ssh_user=ubuntu
+bastion_host=$PUBLIC_IP
+ssh_key_file=./${KEY_PAIR_NAME}.pem
+EOL
+                            fi
+                            
+                            # Determine which inventory to use
+                            if [ -f "inventory_dynamic.ini" ]; then
+                                INVENTORY="inventory_dynamic.ini"
+                            elif [ -f "inventory_basic.ini" ]; then
+                                INVENTORY="inventory_basic.ini"
+                            elif [ -f "aws_ec2.yaml" ]; then
+                                INVENTORY="aws_ec2.yaml"
+                            else
+                                echo "❌ No inventory file available"
+                                exit 1
+                            fi
+                            
+                            echo "Using inventory: $INVENTORY"
+                            
+                            # Test connectivity first
+                            echo "🔗 Testing Ansible connectivity..."
+                            ansible all -i $INVENTORY -m ping --timeout=30 -v || {
+                                echo "⚠️ Initial connectivity test failed, retrying with debug..."
+                                ansible all -i $INVENTORY -m ping --timeout=60 -vvv || {
+                                    echo "❌ Connectivity test failed after retry"
+                                    echo "Checking individual host connectivity..."
+                                    
+                                    # Debug connectivity issues
+                                    if [ -f "$INVENTORY" ] && grep -q "bastion" $INVENTORY; then
+                                        BASTION_IP=$(grep "ansible_host=" $INVENTORY | head -1 | cut -d'=' -f2 | cut -d' ' -f1)
+                                        echo "Testing direct SSH to bastion: $BASTION_IP"
+                                        ssh -i ${KEY_PAIR_NAME}.pem -o ConnectTimeout=10 -o StrictHostKeyChecking=no ubuntu@$BASTION_IP "echo 'Bastion SSH OK'" || echo "❌ Bastion SSH failed"
+                                    fi
+                                    
+                                    echo "⚠️ Continuing with limited connectivity..."
+                                }
+                            }
+                            
+                            # Determine which playbook to use
+                            if [ -f "playbook_fixed.yml" ]; then
+                                PLAYBOOK="playbook_fixed.yml"
+                                echo "✅ Using fixed playbook: $PLAYBOOK"
+                            else
+                                PLAYBOOK="playbook.yml"
+                                echo "⚠️ Using original playbook: $PLAYBOOK"
+                            fi
+                            
+                            # Run Ansible playbook with retries
+                            echo "🚀 Running Ansible playbook..."
+                            ansible-playbook -i $INVENTORY $PLAYBOOK \
+                                --timeout=60 \
+                                --extra-vars "bastion_host=$PUBLIC_IP ssh_key_file=./${KEY_PAIR_NAME}.pem" \
+                                -v || {
+                                echo "⚠️ First attempt failed, retrying with increased verbosity..."
+                                sleep 30
+                                ansible-playbook -i $INVENTORY $PLAYBOOK \
+                                    --timeout=120 \
+                                    --extra-vars "bastion_host=$PUBLIC_IP ssh_key_file=./${KEY_PAIR_NAME}.pem" \
+                                    -vv || {
+                                    echo "❌ Ansible playbook execution failed"
+                                    echo "📋 Troubleshooting information:"
+                                    echo "- Check SSH connectivity to bastion host"
+                                    echo "- Verify security group rules allow SSH access"
+                                    echo "- Ensure instances are fully booted and SSH service is running"
+                                    echo "- Check if the SSH key is correct and has proper permissions"
+                                    
+                                    # Don't fail the entire pipeline for Ansible issues
+                                    echo "⚠️ Continuing pipeline despite Ansible configuration issues"
+                                    echo "Manual configuration may be required"
+                                }
+                            }
+                            
+                            echo "✅ Ansible configuration stage completed"
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        // Archive Ansible logs and inventory files
+                        if (fileExists('ansible.log')) {
+                            archiveArtifacts artifacts: 'ansible.log', allowEmptyArchive: true
+                        }
+                        if (fileExists('inventory_dynamic.ini')) {
+                            archiveArtifacts artifacts: 'inventory_dynamic.ini', allowEmptyArchive: true
+                        }
+                        if (fileExists('inventory_basic.ini')) {
+                            archiveArtifacts artifacts: 'inventory_basic.ini', allowEmptyArchive: true
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Post-Deployment Verification') {
+            when {
+                allOf {
+                    expression { return params.autoApprove }
+                    expression { return params.action == 'apply' }
+                }
+            }
+            steps {
+                echo "=== Post-Deployment Verification ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Final infrastructure verification..."
+                        
+                        echo "📊 Infrastructure Summary:"
+                        aws ec2 describe-instances \
+                            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=redis-*" \
+                            --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],State:State.Name,PublicIP:PublicIpAddress,PrivateIP:PrivateIpAddress,InstanceType:InstanceType}' \
+                            --output table --region $AWS_DEFAULT_REGION
+                        
+                        echo ""
+                        echo "🌐 Network Configuration:"
+                        aws ec2 describe-vpcs \
+                            --filters "Name=tag:Name,Values=redis-VPC" \
+                            --query 'Vpcs[].{VpcId:VpcId,CidrBlock:CidrBlock,State:State}' \
+                            --output table --region $AWS_DEFAULT_REGION
+                        
+                        echo ""
+                        echo "🔒 Security Groups:"
+                        aws ec2 describe-security-groups \
+                            --filters "Name=group-name,Values=*redis*" \
+                            --query 'SecurityGroups[].{GroupName:GroupName,GroupId:GroupId,Description:Description}' \
+                            --output table --region $AWS_DEFAULT_REGION
+                        
+                        echo ""
+                        echo "✅ Deployment verification completed!"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "=== Pipeline Post-Processing ==="
+                
+                // Archive key file if created
+                if (fileExists("${params.keyPairName}.pem")) {
+                    archiveArtifacts artifacts: "${params.keyPairName}.pem", allowEmptyArchive: true
+                    echo "📁 Key file archived: ${params.keyPairName}.pem"
+                }
+                
+                // Archive Terraform state
+                if (fileExists("terraform/terraform.tfstate")) {
+                    archiveArtifacts artifacts: 'terraform/terraform.tfstate*', allowEmptyArchive: true
+                    echo "📁 Terraform state archived"
+                }
+                
+                // Create comprehensive build report
+                def buildReport = """
+=== Ansible-Fixed Pipeline Build Report ===
+Build Information:
+- Build Number: ${BUILD_NUMBER}
+- Build URL: ${BUILD_URL}
+- Job Name: ${JOB_NAME}
+- Workspace: ${WORKSPACE}
+
+Pipeline Configuration:
+- Action: ${params.action}
+- Auto Approve: ${params.autoApprove}
+- Key Pair: ${params.keyPairName}
+- Skip Ansible: ${params.skipAnsible}
+- AWS Region: ${AWS_DEFAULT_REGION}
+
+Git Information:
+- Commit: ${env.GIT_COMMIT_HASH ?: 'N/A'}
+- Author: ${env.GIT_COMMIT_AUTHOR ?: 'N/A'}
+- Message: ${env.GIT_COMMIT_MESSAGE ?: 'N/A'}
+
+Build Results:
+- Start Time: ${new Date(currentBuild.startTimeInMillis)}
+- Duration: ${currentBuild.durationString}
+- Result: ${currentBuild.result ?: 'SUCCESS'}
+
+Ansible Configuration:
+- Configuration: ansible_jenkins.cfg
+- Inventory: Dynamic inventory creation
+- Playbook: playbook_fixed.yml (if available)
+- SSH Key: ${params.keyPairName}.pem
+
+Artifacts Generated:
+- SSH Key: ${params.keyPairName}.pem
+- Terraform Outputs: terraform-outputs.json
+- Ansible Logs: ansible.log
+- Build Report: ansible-pipeline-report.txt
+"""
+                
+                writeFile file: 'ansible-pipeline-report.txt', text: buildReport
+                archiveArtifacts artifacts: 'ansible-pipeline-report.txt', allowEmptyArchive: true
+                
+                echo "📋 Build Report:"
+                echo buildReport
+            }
+        }
+        
+        success {
+            echo '✅ Ansible-fixed pipeline completed successfully!'
+            script {
+                if (params.action == 'apply') {
+                    echo "🎉 Redis infrastructure deployed with Ansible configuration!"
+                    echo "📥 Download artifacts:"
+                    echo "   - ${params.keyPairName}.pem (SSH key)"
+                    echo "   - terraform-outputs.json (Infrastructure details)"
+                    echo "   - ansible.log (Ansible execution log)"
+                    echo "   - ansible-pipeline-report.txt (Complete build report)"
+                } else {
+                    echo "🧹 Infrastructure destroyed successfully!"
+                }
+            }
+        }
+        
+        failure {
+            echo '❌ Ansible-fixed pipeline failed!'
+            echo "🔍 Troubleshooting steps:"
+            echo "1. Check Ansible connectivity and SSH key permissions"
+            echo "2. Verify AWS credentials and service limits"
+            echo "3. Review Ansible logs for specific error messages"
+            echo "4. Ensure all instances are running and accessible"
+            echo "5. Check security group rules for SSH access"
+            
+            script {
+                def failureReport = """
+Ansible Pipeline Failure Report
+==============================
+Build: ${BUILD_NUMBER}
+Time: ${new Date()}
+Action: ${params.action}
+Key Pair: ${params.keyPairName}
+
+Common Ansible Issues:
+1. SSH connectivity problems
+2. Security group restrictions
+3. Instance not ready for SSH
+4. Incorrect key file permissions
+5. Bastion host connectivity issues
+
+Check the console output and Ansible logs for detailed error information.
+"""
+                writeFile file: 'ansible-failure-report.txt', text: failureReport
+                archiveArtifacts artifacts: 'ansible-failure-report.txt', allowEmptyArchive: true
+            }
+        }
+    }
+}

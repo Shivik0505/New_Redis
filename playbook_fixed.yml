@@ -1,0 +1,126 @@
+---
+- name: Configure Redis Cluster
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    ansible_ssh_user: ubuntu
+    ansible_ssh_private_key_file: "{{ ssh_key_file | default('./redis-infra-key.pem') }}"
+    ansible_ssh_common_args: >-
+      -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=30
+      -o ServerAliveInterval=60
+      -o ServerAliveCountMax=3
+      {% if bastion_host is defined %}
+      -o ProxyCommand="ssh -W %h:%p -i {{ ansible_ssh_private_key_file }} -o StrictHostKeyChecking=no ubuntu@{{ bastion_host }}"
+      {% endif %}
+  
+  pre_tasks:
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        connect_timeout: 20
+        sleep: 5
+        delay: 5
+        timeout: 300
+    
+    - name: Gather facts
+      setup:
+    
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      retries: 3
+      delay: 10
+  
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - redis-server
+          - redis-tools
+          - python3-pip
+        state: present
+        update_cache: yes
+      retries: 3
+      delay: 10
+    
+    - name: Install redis-py for Ansible redis modules
+      pip:
+        name: redis
+        state: present
+    
+    - name: Stop Redis service for configuration
+      service:
+        name: redis-server
+        state: stopped
+    
+    - name: Backup original Redis configuration
+      copy:
+        src: /etc/redis/redis.conf
+        dest: /etc/redis/redis.conf.backup
+        remote_src: yes
+        backup: yes
+    
+    - name: Configure Redis for clustering
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backup: yes
+      loop:
+        - { regexp: '^bind ', line: 'bind 0.0.0.0' }
+        - { regexp: '^# cluster-enabled ', line: 'cluster-enabled yes' }
+        - { regexp: '^# cluster-config-file ', line: 'cluster-config-file nodes-6379.conf' }
+        - { regexp: '^# cluster-node-timeout ', line: 'cluster-node-timeout 15000' }
+        - { regexp: '^appendonly ', line: 'appendonly yes' }
+        - { regexp: '^protected-mode ', line: 'protected-mode no' }
+      notify: restart redis
+    
+    - name: Set Redis to listen on all interfaces
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^bind 127.0.0.1'
+        line: 'bind 0.0.0.0'
+        backup: yes
+      notify: restart redis
+    
+    - name: Create Redis log directory
+      file:
+        path: /var/log/redis
+        state: directory
+        owner: redis
+        group: redis
+        mode: '0755'
+    
+    - name: Start and enable Redis service
+      service:
+        name: redis-server
+        state: started
+        enabled: yes
+    
+    - name: Wait for Redis to be ready
+      wait_for:
+        port: 6379
+        host: "{{ ansible_default_ipv4.address }}"
+        delay: 5
+        timeout: 60
+    
+    - name: Test Redis connectivity
+      command: redis-cli -h {{ ansible_default_ipv4.address }} ping
+      register: redis_ping
+      retries: 5
+      delay: 3
+      until: redis_ping.stdout == "PONG"
+    
+    - name: Display Redis status
+      debug:
+        msg: "Redis is running on {{ ansible_default_ipv4.address }}:6379"
+  
+  handlers:
+    - name: restart redis
+      service:
+        name: redis-server
+        state: restarted
+      listen: restart redis
