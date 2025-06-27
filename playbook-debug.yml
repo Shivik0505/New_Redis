@@ -1,0 +1,46 @@
+---
+- name: SSH Connectivity Debug
+  hosts: redis_nodes
+  gather_facts: no
+  vars:
+    ansible_ssh_user: ubuntu
+    ansible_ssh_private_key_file: "./redis-infra-key.pem"
+    ansible_ssh_common_args: >-
+      -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=30
+      -o ServerAliveInterval=60
+      -o ServerAliveCountMax=3
+      -o ProxyCommand="ssh -W %h:%p -i ./redis-infra-key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@{{ bastion_host }}"
+  
+  tasks:
+    - name: Test raw connection
+      raw: echo "SSH connection successful"
+      register: ssh_test
+    
+    - name: Display connection result
+      debug:
+        msg: "SSH connection to {{ inventory_hostname }} successful"
+    
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        connect_timeout: 30
+        timeout: 300
+    
+    - name: Gather minimal facts
+      setup:
+        gather_subset: min
+    
+    - name: Test sudo access
+      become: yes
+      command: whoami
+      register: sudo_test
+    
+    - name: Display system info
+      debug:
+        msg: |
+          Host: {{ inventory_hostname }}
+          IP: {{ ansible_host }}
+          User: {{ ansible_user }}
+          Sudo test: {{ sudo_test.stdout }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
