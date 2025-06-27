@@ -1,0 +1,388 @@
+pipeline {
+    agent any
+
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+
+    parameters {
+        booleanParam(name: 'autoApprove', defaultValue: true, description: 'Automatically run apply after generating plan?')
+        choice(name: 'action', choices: ['apply', 'destroy'], description: 'Select the action to perform')
+        string(name: 'keyPairName', defaultValue: 'redis-infra-key', description: 'AWS Key Pair name to use')
+        booleanParam(name: 'recreateKeyPair', defaultValue: false, description: 'Force recreate key pair if it exists?')
+        booleanParam(name: 'skipAnsible', defaultValue: false, description: 'Skip Ansible configuration step?')
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        KEY_PAIR_NAME = "${params.keyPairName}"
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT = 'false'
+        ANSIBLE_HOST_KEY_CHECKING = 'False'
+        ANSIBLE_SSH_RETRIES = '3'
+        ANSIBLE_TIMEOUT = '30'
+    }
+
+    stages {
+        stage('Environment Setup') {
+            steps {
+                echo "=== Environment Setup ==="
+                sh '''
+                    echo "Pipeline Parameters:"
+                    echo "- Action: ${action}"
+                    echo "- Auto Approve: ${autoApprove}"
+                    echo "- Key Pair: ${keyPairName}"
+                    echo "- Skip Ansible: ${skipAnsible}"
+                    echo "- AWS Region: ${AWS_DEFAULT_REGION}"
+                    
+                    echo "Checking required tools..."
+                    which terraform || echo "❌ Terraform not found"
+                    which aws || echo "❌ AWS CLI not found"
+                    which ansible || echo "❌ Ansible not found"
+                    
+                    terraform version || echo "❌ Terraform version check failed"
+                    aws --version || echo "❌ AWS CLI version check failed"
+                    ansible --version || echo "❌ Ansible version check failed"
+                '''
+            }
+        }
+
+        stage('Clone Repository') {
+            steps {
+                echo "=== Cloning Repository ==="
+                checkout scm
+                
+                script {
+                    try {
+                        def commitId = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                        def commitMsg = sh(returnStdout: true, script: 'git log -1 --pretty=%B').trim()
+                        def commitAuthor = sh(returnStdout: true, script: 'git log -1 --pretty=%an').trim()
+                        
+                        echo "✅ Repository cloned successfully"
+                        echo "Commit ID: ${commitId}"
+                        echo "Commit Message: ${commitMsg}"
+                        echo "Commit Author: ${commitAuthor}"
+                    } catch (Exception e) {
+                        echo "⚠️ Could not get git information: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('AWS Credentials Check') {
+            steps {
+                echo "=== AWS Credentials Verification ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Testing AWS credentials..."
+                        if aws sts get-caller-identity; then
+                            echo "✅ AWS credentials are valid"
+                        else
+                            echo "❌ AWS credentials test failed"
+                            exit 1
+                        fi
+                        
+                        echo "Checking AWS service limits..."
+                        aws ec2 describe-account-attributes --attribute-names supported-platforms --region $AWS_DEFAULT_REGION || echo "⚠️ Could not check account attributes"
+                    '''
+                }
+            }
+        }
+
+        stage('Key Pair Management') {
+            when {
+                expression { return params.action == 'apply' }
+            }
+            steps {
+                echo "=== Key Pair Management ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    script {
+                        sh '''
+                            echo "Managing key pair: $KEY_PAIR_NAME"
+                            
+                            # Function to create key pair
+                            create_key_pair() {
+                                echo "Creating new key pair '$KEY_PAIR_NAME'..."
+                                if aws ec2 create-key-pair --key-name "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION --query 'KeyMaterial' --output text > "${KEY_PAIR_NAME}.pem"; then
+                                    chmod 400 "${KEY_PAIR_NAME}.pem"
+                                    echo "✅ Key pair created successfully!"
+                                    return 0
+                                else
+                                    echo "❌ Failed to create key pair"
+                                    return 1
+                                fi
+                            }
+                            
+                            # Check if key pair exists in AWS
+                            if aws ec2 describe-key-pairs --key-names "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION >/dev/null 2>&1; then
+                                echo "Key pair '$KEY_PAIR_NAME' exists in AWS"
+                                
+                                if [ "${recreateKeyPair}" = "true" ]; then
+                                    echo "Recreating key pair as requested..."
+                                    aws ec2 delete-key-pair --key-name "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION
+                                    create_key_pair
+                                else
+                                    echo "✅ Using existing key pair"
+                                    echo "⚠️ Note: .pem file not available in Jenkins for existing key pairs"
+                                fi
+                            else
+                                echo "Key pair does not exist, creating new one..."
+                                create_key_pair
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Initialize') {
+            steps {
+                echo "=== Terraform Initialize ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        cd terraform/
+                        
+                        echo "Initializing Terraform..."
+                        if terraform init -input=false; then
+                            echo "✅ Terraform initialized successfully"
+                        else
+                            echo "❌ Terraform initialization failed"
+                            exit 1
+                        fi
+                        
+                        echo "Validating Terraform configuration..."
+                        if terraform validate; then
+                            echo "✅ Terraform configuration is valid"
+                        else
+                            echo "❌ Terraform validation failed"
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                echo "=== Terraform Plan ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        cd terraform/
+                        
+                        echo "Creating Terraform plan..."
+                        terraform plan -input=false -out=tfplan -var="key-name=${KEY_PAIR_NAME}" -detailed-exitcode || {
+                            exit_code=$?
+                            if [ $exit_code -eq 2 ]; then
+                                echo "✅ Changes detected in plan"
+                                exit 0
+                            else
+                                echo "❌ Plan failed with exit code $exit_code"
+                                exit $exit_code
+                            fi
+                        }
+                        
+                        echo "✅ Terraform plan created successfully"
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'terraform/tfplan', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Terraform Execute') {
+            when {
+                expression { return params.autoApprove }
+            }
+            steps {
+                echo "=== Terraform Execute ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    script {
+                        if (params.action == 'apply') {
+                            sh '''
+                                cd terraform/
+                                
+                                echo "Applying Terraform plan..."
+                                if terraform apply -input=false tfplan; then
+                                    echo "✅ Terraform apply completed successfully"
+                                else
+                                    echo "❌ Terraform apply failed"
+                                    exit 1
+                                fi
+                                
+                                echo "Generating outputs..."
+                                terraform output -json > ../terraform-outputs.json
+                                terraform output
+                            '''
+                        } else if (params.action == 'destroy') {
+                            sh '''
+                                cd terraform/
+                                
+                                echo "Destroying infrastructure..."
+                                if terraform destroy -input=false -var="key-name=${KEY_PAIR_NAME}" --auto-approve; then
+                                    echo "✅ Infrastructure destroyed successfully"
+                                else
+                                    echo "❌ Terraform destroy failed"
+                                    exit 1
+                                fi
+                                
+                                echo "Cleaning up key pair..."
+                                if aws ec2 describe-key-pairs --key-names "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION >/dev/null 2>&1; then
+                                    aws ec2 delete-key-pair --key-name "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION
+                                    echo "✅ Key pair deleted"
+                                fi
+                            '''
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        if (params.action == 'apply' && fileExists('terraform-outputs.json')) {
+                            archiveArtifacts artifacts: 'terraform-outputs.json', allowEmptyArchive: true
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Infrastructure Verification') {
+            when {
+                allOf {
+                    expression { return params.autoApprove }
+                    expression { return params.action == 'apply' }
+                }
+            }
+            steps {
+                echo "=== Infrastructure Verification ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Waiting for instances to be ready..."
+                        sleep 60
+                        
+                        echo "Checking instance status..."
+                        aws ec2 describe-instances \
+                            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=redis-*" \
+                            --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],State:State.Name,PublicIP:PublicIpAddress,PrivateIP:PrivateIpAddress,InstanceType:InstanceType}' \
+                            --output table --region $AWS_DEFAULT_REGION
+                        
+                        # Verify all expected instances are running
+                        RUNNING_INSTANCES=$(aws ec2 describe-instances \
+                            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=redis-*" \
+                            --query 'length(Reservations[].Instances[])' \
+                            --output text --region $AWS_DEFAULT_REGION)
+                        
+                        echo "Running instances: $RUNNING_INSTANCES"
+                        if [ "$RUNNING_INSTANCES" -eq 4 ]; then
+                            echo "✅ All 4 instances are running"
+                        else
+                            echo "⚠️ Expected 4 instances, found $RUNNING_INSTANCES"
+                        fi
+                        
+                        echo "Additional wait for SSH readiness..."
+                        sleep 30
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // Archive important files
+                if (fileExists("${params.keyPairName}.pem")) {
+                    archiveArtifacts artifacts: "${params.keyPairName}.pem", allowEmptyArchive: true
+                }
+                
+                if (fileExists("terraform/terraform.tfstate")) {
+                    archiveArtifacts artifacts: 'terraform/terraform.tfstate*', allowEmptyArchive: true
+                }
+                
+                // Generate summary report
+                sh '''
+                    echo "=== Pipeline Summary ===" > pipeline-summary.txt
+                    echo "Action: ${action}" >> pipeline-summary.txt
+                    echo "Key Pair: ${keyPairName}" >> pipeline-summary.txt
+                    echo "Region: ${AWS_DEFAULT_REGION}" >> pipeline-summary.txt
+                    echo "Completion Time: $(date)" >> pipeline-summary.txt
+                    echo "" >> pipeline-summary.txt
+                    
+                    if [ "${action}" = "apply" ]; then
+                        echo "Infrastructure Status:" >> pipeline-summary.txt
+                        aws ec2 describe-instances \
+                            --filters "Name=tag:Name,Values=redis-*" \
+                            --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],State:State.Name,PublicIP:PublicIpAddress,PrivateIP:PrivateIpAddress}' \
+                            --output table --region $AWS_DEFAULT_REGION >> pipeline-summary.txt 2>/dev/null || echo "Could not retrieve instance information" >> pipeline-summary.txt
+                    fi
+                '''
+                
+                archiveArtifacts artifacts: 'pipeline-summary.txt', allowEmptyArchive: true
+            }
+            
+            // Cleanup temporary files
+            sh '''
+                find . -name "*.log" -delete 2>/dev/null || true
+                rm -rf terraform/.terraform/providers 2>/dev/null || true
+            '''
+        }
+        
+        failure {
+            echo '❌ Pipeline failed!'
+            sh '''
+                echo "=== Failure Diagnostics ==="
+                echo "Checking for partially created resources..."
+                
+                aws ec2 describe-instances --region $AWS_DEFAULT_REGION \
+                    --filters "Name=tag:Name,Values=redis-*" \
+                    --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],State:State.Name,InstanceId:InstanceId}' \
+                    --output table 2>/dev/null || echo "Could not check instances"
+                
+                echo ""
+                echo "💡 Troubleshooting Tips:"
+                echo "1. Check AWS credentials are properly configured in Jenkins"
+                echo "2. Verify AWS service limits (VPCs, Elastic IPs, EC2 instances)"
+                echo "3. Check if resources already exist with the same names"
+                echo "4. Review Terraform state for conflicts"
+                echo "5. Consider running 'terraform destroy' to clean up partial deployments"
+            '''
+        }
+        
+        success {
+            echo '✅ Pipeline completed successfully!'
+            script {
+                if (params.action == 'apply') {
+                    echo "🎉 Redis infrastructure deployed successfully!"
+                    echo "Key pair used: ${params.keyPairName}"
+                    echo "📥 Download the following artifacts:"
+                    echo "  - ${params.keyPairName}.pem (SSH key)"
+                    echo "  - terraform-outputs.json (Infrastructure details)"
+                    echo "  - pipeline-summary.txt (Deployment summary)"
+                } else {
+                    echo "🧹 Infrastructure destroyed successfully!"
+                }
+            }
+        }
+    }
+}
