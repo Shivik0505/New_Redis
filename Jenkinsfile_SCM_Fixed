@@ -1,0 +1,499 @@
+pipeline {
+    agent any
+
+    // Enhanced SCM Polling Configuration
+    triggers {
+        // Poll SCM every 5 minutes for changes
+        pollSCM('H/5 * * * *')
+    }
+
+    parameters {
+        booleanParam(name: 'autoApprove', defaultValue: true, description: 'Automatically run apply after generating plan?')
+        choice(name: 'action', choices: ['apply', 'destroy'], description: 'Select the action to perform')
+        string(name: 'keyPairName', defaultValue: 'redis-infra-key', description: 'AWS Key Pair name to use')
+        booleanParam(name: 'recreateKeyPair', defaultValue: false, description: 'Force recreate key pair if it exists?')
+        booleanParam(name: 'skipAnsible', defaultValue: false, description: 'Skip Ansible configuration step?')
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        KEY_PAIR_NAME = "${params.keyPairName}"
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT = 'false'
+        ANSIBLE_HOST_KEY_CHECKING = 'False'
+    }
+
+    options {
+        // Keep only last 10 builds
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        
+        // Timeout after 2 hours
+        timeout(time: 2, unit: 'HOURS')
+        
+        // Skip default checkout - we'll do it explicitly
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('SCM Checkout & Validation') {
+            steps {
+                script {
+                    echo "=== Enhanced SCM Checkout & Validation ==="
+                    
+                    // Clean workspace before checkout
+                    cleanWs()
+                    
+                    // Explicit checkout with detailed logging
+                    def scmVars = checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/master']],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [$class: 'CleanBeforeCheckout'],
+                            [$class: 'CloneOption', depth: 1, noTags: false, shallow: true]
+                        ],
+                        userRemoteConfigs: [[
+                            url: 'https://github.com/Shivik0505/New_Redis.git'
+                        ]]
+                    ])
+                    
+                    // Display SCM information
+                    echo "✅ SCM Checkout completed successfully"
+                    echo "📋 SCM Variables:"
+                    scmVars.each { key, value ->
+                        echo "   ${key}: ${value}"
+                    }
+                    
+                    // Get detailed git information
+                    def gitCommit = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                    def gitBranch = sh(returnStdout: true, script: 'git rev-parse --abbrev-ref HEAD').trim()
+                    def gitAuthor = sh(returnStdout: true, script: 'git log -1 --pretty=%an').trim()
+                    def gitMessage = sh(returnStdout: true, script: 'git log -1 --pretty=%B').trim()
+                    def gitTimestamp = sh(returnStdout: true, script: 'git log -1 --pretty=%ci').trim()
+                    
+                    echo "📝 Git Information:"
+                    echo "   Commit Hash: ${gitCommit}"
+                    echo "   Branch: ${gitBranch}"
+                    echo "   Author: ${gitAuthor}"
+                    echo "   Message: ${gitMessage}"
+                    echo "   Timestamp: ${gitTimestamp}"
+                    
+                    // Store git info for later use
+                    env.GIT_COMMIT_HASH = gitCommit
+                    env.GIT_COMMIT_MESSAGE = gitMessage
+                    env.GIT_COMMIT_AUTHOR = gitAuthor
+                    env.GIT_BRANCH = gitBranch
+                    
+                    // Check for changed files in this commit
+                    try {
+                        def changedFiles = sh(returnStdout: true, script: 'git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "No previous commit"').trim()
+                        if (changedFiles && changedFiles != "No previous commit") {
+                            echo "📝 Files changed in this commit:"
+                            changedFiles.split('\n').each { file ->
+                                echo "   - ${file}"
+                            }
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ Could not determine changed files: ${e.getMessage()}"
+                    }
+                    
+                    // Validate repository structure
+                    def requiredFiles = ['terraform/', 'ansible/', 'Jenkinsfile', 'README.md']
+                    requiredFiles.each { file ->
+                        if (fileExists(file)) {
+                            echo "✅ Required file/directory found: ${file}"
+                        } else {
+                            error "❌ Required file/directory missing: ${file}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Trigger Analysis') {
+            steps {
+                script {
+                    echo "=== Build Trigger Analysis ==="
+                    
+                    def buildCauses = currentBuild.getBuildCauses()
+                    echo "🔄 Build Trigger Information:"
+                    
+                    def scmTriggered = false
+                    def webhookTriggered = false
+                    def manualTriggered = false
+                    
+                    buildCauses.each { cause ->
+                        def causeType = cause.getClass().getSimpleName()
+                        echo "   Trigger Type: ${causeType}"
+                        
+                        if (cause.hasProperty('shortDescription')) {
+                            echo "   Description: ${cause.shortDescription}"
+                        }
+                        
+                        // Identify trigger types
+                        if (causeType.contains('SCM') || causeType.contains('Timer')) {
+                            scmTriggered = true
+                            echo "   ✅ SCM Polling Trigger Detected"
+                        } else if (causeType.contains('GitHub') || causeType.contains('Webhook')) {
+                            webhookTriggered = true
+                            echo "   ✅ Webhook Trigger Detected"
+                        } else if (causeType.contains('User')) {
+                            manualTriggered = true
+                            echo "   ✅ Manual Trigger Detected"
+                        }
+                    }
+                    
+                    // Set environment variables for trigger type
+                    env.TRIGGERED_BY_SCM = scmTriggered.toString()
+                    env.TRIGGERED_BY_WEBHOOK = webhookTriggered.toString()
+                    env.TRIGGERED_BY_MANUAL = manualTriggered.toString()
+                    
+                    // Log build context
+                    echo "📊 Build Context:"
+                    echo "   Build Number: ${BUILD_NUMBER}"
+                    echo "   Build URL: ${BUILD_URL}"
+                    echo "   Job Name: ${JOB_NAME}"
+                    echo "   Workspace: ${WORKSPACE}"
+                    echo "   Node Name: ${NODE_NAME}"
+                    echo "   Build Timestamp: ${new Date()}"
+                }
+            }
+        }
+
+        stage('Environment Setup') {
+            steps {
+                echo "=== Environment Setup ==="
+                sh '''
+                    echo "🔧 Pipeline Configuration:"
+                    echo "- Action: ${action}"
+                    echo "- Auto Approve: ${autoApprove}"
+                    echo "- Key Pair: ${keyPairName}"
+                    echo "- Skip Ansible: ${skipAnsible}"
+                    echo "- AWS Region: ${AWS_DEFAULT_REGION}"
+                    echo ""
+                    echo "📋 Git Context:"
+                    echo "- Commit: ${GIT_COMMIT_HASH}"
+                    echo "- Branch: ${GIT_BRANCH}"
+                    echo "- Author: ${GIT_COMMIT_AUTHOR}"
+                    echo ""
+                    echo "🔄 Trigger Context:"
+                    echo "- SCM Triggered: ${TRIGGERED_BY_SCM}"
+                    echo "- Webhook Triggered: ${TRIGGERED_BY_WEBHOOK}"
+                    echo "- Manual Triggered: ${TRIGGERED_BY_MANUAL}"
+                    echo ""
+                    echo "🛠️ Tool Verification:"
+                    which terraform && terraform version || echo "❌ Terraform not found"
+                    which aws && aws --version || echo "❌ AWS CLI not found"
+                    which ansible && ansible --version || echo "❌ Ansible not found"
+                '''
+            }
+        }
+
+        stage('AWS Credentials Check') {
+            steps {
+                echo "=== AWS Credentials Verification ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Testing AWS credentials..."
+                        if aws sts get-caller-identity; then
+                            echo "✅ AWS credentials are valid"
+                        else
+                            echo "❌ AWS credentials test failed"
+                            exit 1
+                        fi
+                        
+                        echo "Checking AWS service limits..."
+                        aws ec2 describe-account-attributes --attribute-names supported-platforms --region $AWS_DEFAULT_REGION || echo "⚠️ Could not check account attributes"
+                        
+                        echo "Checking existing Redis resources..."
+                        aws ec2 describe-instances --region $AWS_DEFAULT_REGION \
+                            --filters "Name=tag:Name,Values=redis-*" \
+                            --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],State:State.Name,InstanceId:InstanceId}' \
+                            --output table || echo "No existing Redis instances found"
+                    '''
+                }
+            }
+        }
+
+        stage('Key Pair Management') {
+            when {
+                expression { return params.action == 'apply' }
+            }
+            steps {
+                echo "=== Key Pair Management ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Managing key pair: $KEY_PAIR_NAME"
+                        
+                        create_key_pair() {
+                            echo "Creating new key pair '$KEY_PAIR_NAME'..."
+                            if aws ec2 create-key-pair --key-name "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION --query 'KeyMaterial' --output text > "${KEY_PAIR_NAME}.pem"; then
+                                chmod 400 "${KEY_PAIR_NAME}.pem"
+                                echo "✅ Key pair created successfully!"
+                                return 0
+                            else
+                                echo "❌ Failed to create key pair"
+                                return 1
+                            fi
+                        }
+                        
+                        if aws ec2 describe-key-pairs --key-names "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION >/dev/null 2>&1; then
+                            echo "✅ Key pair '$KEY_PAIR_NAME' exists in AWS"
+                            
+                            if [ "${recreateKeyPair}" = "true" ]; then
+                                echo "Recreating key pair as requested..."
+                                aws ec2 delete-key-pair --key-name "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION
+                                create_key_pair
+                            else
+                                echo "✅ Using existing key pair"
+                                echo "⚠️ Note: .pem file not available for existing key pairs"
+                            fi
+                        else
+                            echo "Key pair does not exist, creating new one..."
+                            create_key_pair
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Operations') {
+            steps {
+                echo "=== Terraform Operations ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    script {
+                        dir('terraform') {
+                            echo "Initializing Terraform..."
+                            sh 'terraform init -input=false'
+                            
+                            echo "Validating Terraform configuration..."
+                            sh 'terraform validate'
+                            
+                            if (params.action == 'apply') {
+                                echo "Creating Terraform plan..."
+                                sh "terraform plan -input=false -out=tfplan -var='key-name=${KEY_PAIR_NAME}'"
+                                
+                                if (params.autoApprove) {
+                                    echo "Applying Terraform plan..."
+                                    sh 'terraform apply -input=false tfplan'
+                                    
+                                    echo "Generating Terraform outputs..."
+                                    sh 'terraform output -json > ../terraform-outputs.json'
+                                    sh 'terraform output'
+                                    
+                                    echo "✅ Infrastructure deployment completed"
+                                } else {
+                                    echo "⏸️ Terraform plan created, waiting for manual approval"
+                                }
+                            } else if (params.action == 'destroy') {
+                                if (params.autoApprove) {
+                                    echo "Destroying infrastructure..."
+                                    sh "terraform destroy -input=false -var='key-name=${KEY_PAIR_NAME}' --auto-approve"
+                                    
+                                    echo "Cleaning up key pair..."
+                                    sh '''
+                                        if aws ec2 describe-key-pairs --key-names "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION >/dev/null 2>&1; then
+                                            aws ec2 delete-key-pair --key-name "$KEY_PAIR_NAME" --region $AWS_DEFAULT_REGION
+                                            echo "✅ Key pair deleted"
+                                        fi
+                                    '''
+                                    
+                                    echo "✅ Infrastructure destruction completed"
+                                } else {
+                                    echo "⏸️ Destroy plan ready, waiting for manual approval"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'terraform/tfplan', allowEmptyArchive: true
+                    script {
+                        if (fileExists('terraform-outputs.json')) {
+                            archiveArtifacts artifacts: 'terraform-outputs.json', allowEmptyArchive: true
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Infrastructure Verification') {
+            when {
+                allOf {
+                    expression { return params.autoApprove }
+                    expression { return params.action == 'apply' }
+                }
+            }
+            steps {
+                echo "=== Infrastructure Verification ==="
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        echo "Waiting for instances to be ready..."
+                        sleep 60
+                        
+                        echo "Checking deployed instances..."
+                        aws ec2 describe-instances \
+                            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=redis-*" \
+                            --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`].Value|[0],State:State.Name,PublicIP:PublicIpAddress,PrivateIP:PrivateIpAddress,InstanceType:InstanceType}' \
+                            --output table --region $AWS_DEFAULT_REGION
+                        
+                        # Count running instances
+                        RUNNING_INSTANCES=$(aws ec2 describe-instances \
+                            --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=redis-*" \
+                            --query 'length(Reservations[].Instances[])' \
+                            --output text --region $AWS_DEFAULT_REGION)
+                        
+                        echo "Running instances: $RUNNING_INSTANCES"
+                        if [ "$RUNNING_INSTANCES" -eq 4 ]; then
+                            echo "✅ All 4 instances are running (1 bastion + 3 Redis nodes)"
+                        else
+                            echo "⚠️ Expected 4 instances, found $RUNNING_INSTANCES"
+                        fi
+                        
+                        echo "Checking VPC and networking..."
+                        aws ec2 describe-vpcs \
+                            --filters "Name=tag:Name,Values=redis-VPC" \
+                            --query 'Vpcs[].{VpcId:VpcId,CidrBlock:CidrBlock,State:State}' \
+                            --output table --region $AWS_DEFAULT_REGION
+                        
+                        echo "Additional wait for SSH readiness..."
+                        sleep 30
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "=== Pipeline Post-Processing ==="
+                
+                // Archive key file if created
+                if (fileExists("${params.keyPairName}.pem")) {
+                    archiveArtifacts artifacts: "${params.keyPairName}.pem", allowEmptyArchive: true
+                    echo "📁 Key file archived: ${params.keyPairName}.pem"
+                }
+                
+                // Archive Terraform state
+                if (fileExists("terraform/terraform.tfstate")) {
+                    archiveArtifacts artifacts: 'terraform/terraform.tfstate*', allowEmptyArchive: true
+                    echo "📁 Terraform state archived"
+                }
+                
+                // Create comprehensive build report
+                def buildReport = """
+=== SCM-Triggered Build Report ===
+Build Information:
+- Build Number: ${BUILD_NUMBER}
+- Build URL: ${BUILD_URL}
+- Job Name: ${JOB_NAME}
+- Node: ${NODE_NAME}
+- Workspace: ${WORKSPACE}
+
+Trigger Information:
+- SCM Triggered: ${env.TRIGGERED_BY_SCM ?: 'false'}
+- Webhook Triggered: ${env.TRIGGERED_BY_WEBHOOK ?: 'false'}
+- Manual Triggered: ${env.TRIGGERED_BY_MANUAL ?: 'false'}
+
+Git Information:
+- Repository: https://github.com/Shivik0505/New_Redis.git
+- Branch: ${env.GIT_BRANCH ?: 'N/A'}
+- Commit: ${env.GIT_COMMIT_HASH ?: 'N/A'}
+- Author: ${env.GIT_COMMIT_AUTHOR ?: 'N/A'}
+- Message: ${env.GIT_COMMIT_MESSAGE ?: 'N/A'}
+
+Pipeline Configuration:
+- Action: ${params.action}
+- Auto Approve: ${params.autoApprove}
+- Key Pair: ${params.keyPairName}
+- Skip Ansible: ${params.skipAnsible}
+- AWS Region: ${AWS_DEFAULT_REGION}
+
+Build Results:
+- Start Time: ${new Date(currentBuild.startTimeInMillis)}
+- Duration: ${currentBuild.durationString}
+- Result: ${currentBuild.result ?: 'SUCCESS'}
+
+Artifacts Generated:
+- Build Report: scm-build-report.txt
+- Key Pair: ${params.keyPairName}.pem (if created)
+- Terraform Outputs: terraform-outputs.json (if apply)
+- Terraform Plan: terraform/tfplan
+"""
+                
+                writeFile file: 'scm-build-report.txt', text: buildReport
+                archiveArtifacts artifacts: 'scm-build-report.txt', allowEmptyArchive: true
+                
+                echo "📋 Build Report:"
+                echo buildReport
+            }
+        }
+        
+        success {
+            script {
+                echo '✅ SCM-triggered pipeline completed successfully!'
+                
+                def triggerInfo = ""
+                if (env.TRIGGERED_BY_SCM == 'true') {
+                    triggerInfo = "🔄 Triggered by SCM polling"
+                } else if (env.TRIGGERED_BY_WEBHOOK == 'true') {
+                    triggerInfo = "🔗 Triggered by GitHub webhook"
+                } else {
+                    triggerInfo = "👤 Triggered manually"
+                }
+                
+                echo triggerInfo
+                
+                if (params.action == 'apply') {
+                    echo "🚀 Redis infrastructure deployed successfully!"
+                    echo "📥 Download artifacts:"
+                    echo "   - ${params.keyPairName}.pem (SSH key)"
+                    echo "   - terraform-outputs.json (Infrastructure details)"
+                    echo "   - scm-build-report.txt (Build summary)"
+                } else {
+                    echo "🧹 Infrastructure destroyed successfully!"
+                }
+            }
+        }
+        
+        failure {
+            echo '❌ SCM-triggered pipeline failed!'
+            echo "🔍 Troubleshooting steps:"
+            echo "1. Check the console output above for specific errors"
+            echo "2. Verify AWS credentials and permissions"
+            echo "3. Check AWS service limits and quotas"
+            echo "4. Ensure Terraform configuration is valid"
+            echo "5. Review SCM polling configuration"
+            
+            // Create failure report
+            def failureReport = """
+Pipeline Failure Report
+======================
+Build: ${BUILD_NUMBER}
+Time: ${new Date()}
+Trigger: SCM=${env.TRIGGERED_BY_SCM}, Webhook=${env.TRIGGERED_BY_WEBHOOK}, Manual=${env.TRIGGERED_BY_MANUAL}
+Git Commit: ${env.GIT_COMMIT_HASH}
+Action: ${params.action}
+
+Check Jenkins console output for detailed error information.
+"""
+            writeFile file: 'failure-report.txt', text: failureReport
+            archiveArtifacts artifacts: 'failure-report.txt', allowEmptyArchive: true
+        }
+    }
+}
