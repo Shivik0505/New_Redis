@@ -1,8 +1,25 @@
 ---
 - hosts: redis_nodes
   become: yes
+  gather_facts: yes
+  vars:
+    ansible_ssh_private_key_file: "./redis-infra-key.pem"
+    ansible_ssh_user: ubuntu
+  
+  pre_tasks:
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        connect_timeout: 20
+        sleep: 5
+        delay: 5
+        timeout: 300
+    
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      retries: 3
+      delay: 10
+  
   roles:
-    - role: ansible
-      vars:
-        ansible_ssh_private_key_file: "./redis-infra-key.pem"
-        ansible_ssh_user: ubuntu
+    - role: redis
