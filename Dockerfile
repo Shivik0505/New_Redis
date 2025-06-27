@@ -1,13 +1,13 @@
-FROM node:18-alpine
+FROM redis:7-alpine
 
-WORKDIR /app
+# Copy custom Redis configuration if needed
+COPY redis.conf /usr/local/etc/redis/redis.conf
 
-COPY package*.json ./
-RUN npm install
+# Expose Redis port
+EXPOSE 6379
 
-COPY . .
+# Set working directory
+WORKDIR /data
 
-EXPOSE 3000
-
-CMD ["npm", "start"]
-
+# Start Redis server with custom config
+CMD ["redis-server", "/usr/local/etc/redis/redis.conf"]
